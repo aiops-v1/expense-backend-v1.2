@@ -1,6 +1,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { trace, SpanStatusCode } = require('@opentelemetry/api');
 const pool = require('../db');
 const { requireAuth, COOKIE_NAME, AUTH_MODE } = require('../middleware/auth');
 const { bindRouteLogger } = require('../middleware/requestLogger');
@@ -10,6 +11,30 @@ const router = express.Router();
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const BCRYPT_ROUNDS = 12;
+
+// The one manual span in this codebase — everywhere else,
+// getNodeAutoInstrumentations() (tracing.js) covers http/express/mysql2
+// without a line of app code. bcrypt isn't a library OTel knows how to
+// instrument, so its cost (the reason /auth/signup and /auth/signin are
+// this app's slowest routes) would otherwise show up as unexplained silence
+// inside the route handler's own span — confirmed live: a real signup trace
+// showed ~356ms of its 365ms handler span with no child span accounting for
+// it at all. This closes that gap instead of just documenting it.
+const tracer = trace.getTracer('expense-backend');
+async function withBcryptSpan(name, fn) {
+  return tracer.startActiveSpan(name, async (span) => {
+    span.setAttribute('bcrypt.rounds', BCRYPT_ROUNDS);
+    try {
+      return await fn();
+    } catch (err) {
+      span.recordException(err);
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
+}
 
 function signToken(user) {
   return jwt.sign({ sub: user.id, email: user.email }, process.env.JWT_SECRET, {
@@ -60,7 +85,9 @@ router.post('/signup', bindRouteLogger, async (req, res, next) => {
       return res.status(409).json({ error: 'An account with that email already exists' });
     }
 
-    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    const passwordHash = await withBcryptSpan('bcrypt.hash', () =>
+      bcrypt.hash(password, BCRYPT_ROUNDS)
+    );
     const [result] = await pool.query(
       'INSERT INTO users (email, password_hash, display_name) VALUES (?, ?, ?)',
       [normalizedEmail, passwordHash, displayName.trim()]
@@ -92,7 +119,9 @@ router.post('/signin', bindRouteLogger, async (req, res, next) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    const match = await bcrypt.compare(password, user.password_hash);
+    const match = await withBcryptSpan('bcrypt.compare', () =>
+      bcrypt.compare(password, user.password_hash)
+    );
     if (!match) {
       req.log.warn({ reason: 'invalid_credentials', email: normalizedEmail }, 'signin failed');
       return res.status(401).json({ error: 'Invalid email or password' });
